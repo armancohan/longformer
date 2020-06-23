@@ -1,43 +1,44 @@
 import argparse
 import itertools
-from itertools import chain, combinations
-from collections import defaultdict
 import json
+import math
 import os
 import pathlib
 import random
+import re
+from collections import defaultdict
+from itertools import chain, combinations
+from typing import Iterable
 
 import numpy as np
-from typing import Iterable
 import pytorch_lightning as pl
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
 import torch.nn as nn
-from torch.optim.lr_scheduler import LambdaLR
+import torch.nn.functional as F
+from pytorch_lightning import LightningModule, Trainer, data_loader
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.logging import TestTubeLogger
-from pytorch_lightning import LightningModule, Trainer, data_loader
-from pytorch_lightning.overrides.data_parallel import \
-    LightningDistributedDataParallel, LightningDataParallel
-from pytorch_lightning.utilities.debugging import MisconfigurationException
+from pytorch_lightning.overrides.data_parallel import (
+    LightningDataParallel, LightningDistributedDataParallel)
+from torch._six import container_abcs, int_classes, string_classes
 from torch.nn.modules import BCEWithLogitsLoss, CrossEntropyLoss
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data.dataloader import DataLoader
 from torch.utils.data.dataset import Dataset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
-from torch._six import container_abcs, string_classes, int_classes
-import re
-import math
-from apex import amp
-from transformers.data.metrics import squad_metrics
 
-from .hotpot_utils.hotpot_prep import get_roberta_tokenizer, SENT_MARKER_END, TITLE_END
-from .hotpot_utils.hotpot_eval import f1_score as hotpot_f1_score
-from .hotpot_utils.hotpot_eval import exact_match_score, sp_metrics, hotpot_evaluate
-from .hotpot_utils.hotpot_utils import get_final_text
-from longformer.sliding_chunks import pad_to_window_size
+from apex import amp
+from hotpotqa_utils.hotpot_eval import exact_match_score
+from hotpotqa_utils.hotpot_eval import f1_score as hotpot_f1_score
+from hotpotqa_utils.hotpot_eval import hotpot_evaluate, sp_metrics
+from hotpotqa_utils.hotpot_prep import (SENT_MARKER_END, TITLE_END,
+                                        get_roberta_tokenizer)
+from hotpotqa_utils.hotpot_utils import get_final_text
+from longformer import sliding_chunks
 from longformer.longformer import Longformer
+from longformer.sliding_chunks import pad_to_window_size
 
 FIXED_SEED = 9090
 
@@ -235,7 +236,7 @@ def get_activations(model, q_ids, doc_ids, max_seq_len, kwargs, extra_attn, symm
     q_len = q_ids.shape[1]
     doc_len = doc_ids.shape[1]
 
-    attn_mode = getattr(model.decoder.sentence_encoder.layers[0].self_attn, 'attention_mode', 'n2')
+    attn_mode = model.encoder.layer[0].attention.self.attention_mode
     if attn_mode in {'tvm', 'sliding_chunks'} and extra_attn:
         # always attend to the canidate_ids
         include_extra_attention_mask = True
@@ -307,42 +308,33 @@ class HotpotModel(pl.LightningModule):
         self.hparams = args
 
         self.roberta = self.load_roberta()
-        self.answer_score = torch.nn.Linear(self.roberta.args.encoder_embed_dim, 1, bias=False)
+        embed_dim = self.roberta.embeddings.word_embeddings.weight.shape[1]
+        self.answer_score = torch.nn.Linear(embed_dim, 1, bias=False)
 
-        self._extract_features_args = {}
-        self.signpost_interval = getattr(self.roberta.args, 'signpost_interval', -1)
-        if self.signpost_interval > 0:
-            self._extract_features_args['remove_signposts'] = True
+        self.signpost_interval = -1  # not used
         self.hparams = args
 
         self._tokenizer = get_roberta_tokenizer()
 
         self._extract_features_args = {}
-        self.signpost_interval = getattr(self.roberta.args, 'signpost_interval', -1)
-        if self.signpost_interval > 0:
-            self._extract_features_args['remove_signposts'] = True
-        if hasattr(self.args, 'loss_at_different_layers'):
-            self._extract_features_args['return_all_hiddens'] = self.args.loss_at_different_layers
-        else:
-            self._extract_features_args['return_all_hiddens'] = False
 
         if hasattr(self.args, 'question_type_classification_head') and args.question_type_classification_head:
-            self.qa_type_classifier = mlp_classification_head(self.roberta.args.encoder_embed_dim, self.roberta.args.encoder_embed_dim // 2, 3)
+            self.qa_type_classifier = mlp_classification_head(embed_dim, embed_dim // 2, 3)
             self.qa_type_loss = CrossEntropyLoss(ignore_index=-1)
 
 # Build a feed-forward network
         if hasattr(self.args, 'multi_layer_classification_heads') and self.args.multi_layer_classification_heads:
             if not hasattr(self.args, 'mlp_qa_head') or args.mlp_qa_head:
-                self.qa_outputs = mlp_classification_head(self.roberta.args.encoder_embed_dim, self.roberta.args.encoder_embed_dim, 2)
+                self.qa_outputs = mlp_classification_head(embed_dim, embed_dim, 2)
             else:
-                self.qa_outputs = nn.Linear(self.roberta.args.encoder_embed_dim, 2)
-            self.sentence_classifier = mlp_classification_head(self.roberta.args.encoder_embed_dim, self.roberta.args.encoder_embed_dim, 2)
-            self.paragraph_classifier = mlp_classification_head(self.roberta.args.encoder_embed_dim, self.roberta.args.encoder_embed_dim, 2)
+                self.qa_outputs = nn.Linear(embed_dim, 2)
+            self.sentence_classifier = mlp_classification_head(embed_dim, embed_dim, 2)
+            self.paragraph_classifier = mlp_classification_head(embed_dim, embed_dim, 2)
         else:
-            self.qa_outputs = nn.Linear(self.roberta.args.encoder_embed_dim, 2)
-            self.sentence_classifier = nn.Linear(self.roberta.args.encoder_embed_dim, 2)
+            self.qa_outputs = nn.Linear(embed_dim, 2)
+            self.sentence_classifier = nn.Linear(embed_dim, 2)
             if hasattr(self.args, 'paragraph_loss') and self.args.paragraph_loss:
-                self.paragraph_classifier = nn.Linear(self.roberta.args.encoder_embed_dim, 2)
+                self.paragraph_classifier = nn.Linear(embed_dim, 2)
         self.sentence_loss = CrossEntropyLoss(ignore_index=-1)
         self.paragraph_loss = CrossEntropyLoss(ignore_index=-1)
         self.running_metrics = defaultdict(float)
@@ -367,22 +359,25 @@ class HotpotModel(pl.LightningModule):
         if self.args.model_type == 'roberta':
             from fairseq.models.roberta import RobertaModel
             model = RobertaModel.from_pretrained(self.args.model_path, checkpoint_file=self.args.model_filename)
-        elif self.args.model_type == 'longformer':
+        elif self.args.model_type in ['longformer', 'tvm_roberta']:
             model = Longformer.from_pretrained(self.args.model_path)
+            model.resize_token_embeddings(50272)
             for layer in model.encoder.layer:
                 layer.attention.self.attention_mode = self.args.attention_mode
                 self.args.attention_window = layer.attention.self.attention_window
             # create additional projection matrices in the self-attention layers
             # for the candidates to context attention
-            embed_dim = model.args.encoder_embed_dim
-            has_bias = model.model.decoder.sentence_encoder.layers[0].self_attn.q_proj.bias is not None
-            for layer in model.model.decoder.sentence_encoder.layers:
-                for key in ['k', 'v', 'q']:
-                    proj_full = torch.nn.Linear(embed_dim, embed_dim, bias=has_bias)
-                    proj_full.weight.data.copy_(getattr(layer.self_attn, key + '_proj').weight.data)
-                    if has_bias:
-                        proj_full.bias.data.copy_(getattr(layer.self_attn, key + '_proj').bias.data)
-                    layer.self_attn.add_module(key + '_proj_full', proj_full)
+            # embed_dim = model.args.encoder_embed_dim
+            # has_bias = model.model.decoder.sentence_encoder.layers[0].self_attn.q_proj.bias is not None
+            # for layer in model.model.decoder.sentence_encoder.layers:
+            #     for key in ['k', 'v', 'q']:
+            #         proj_full = torch.nn.Linear(embed_dim, embed_dim, bias=has_bias)
+            #         proj_full.weight.data.copy_(getattr(layer.self_attn, key + '_proj').weight.data)
+            #         if has_bias:
+            #             proj_full.bias.data.copy_(getattr(layer.self_attn, key + '_proj').bias.data)
+            #         layer.self_attn.add_module(key + '_proj_full', proj_full)
+        else:
+            assert False
 
         print("Loaded model with config:")
         print(model.config)
@@ -412,9 +407,8 @@ class HotpotModel(pl.LightningModule):
                 "in self.hparams?"
             )
         if overrides is not None:
-            for k in ckpt_hparams:
-                if k in overrides:
-                    ckpt_hparams[k] = overrides[k]
+            for k in overrides:
+                ckpt_hparams[k] = overrides[k]
         hparams = Namespace(**ckpt_hparams)
 
         # load the state_dict on the model automatically
@@ -483,7 +477,7 @@ class HotpotModel(pl.LightningModule):
         """
 
         #roberta, q_ids, doc_ids, max_seq_len, kwargs, do_extra_attention, symmetric_extra_attention, attention_step, use_segment_ids, SENT_TOKEN_ID
-        activations, inners = get_activations(
+        activations = get_activations(
             self.roberta,
             q_ids,
             doc_ids,
@@ -645,7 +639,7 @@ class HotpotModel(pl.LightningModule):
             # sum the span level loss and support fact loss
             if self.args.dynamic_mixing_ratio:
                 # gradually increase mixing ratio to focus more on spans in later
-                mixing_ratio = self._num_grad_updates / self.roberta.args.total_num_update
+                mixing_ratio = self._num_grad_updates / self.args.total_num_updates
                 total_loss = mixing_ratio * span_loss + (1 - mixing_ratio) * output['sent_loss']
                 self.args.mixing_ratio = mixing_ratio
             else:
@@ -685,7 +679,7 @@ class HotpotModel(pl.LightningModule):
         if self.args.linear_mixing is None:
             if self.args.dynamic_mixing_ratio:
                 # gradually increase mixing ratio to focus more on spans in later
-                mixing_ratio = self._num_grad_updates / self.roberta.args.total_num_update
+                mixing_ratio = self._num_grad_updates / self.args.total_num_updates
                 total_loss = mixing_ratio * output['span_loss'] + (1 - mixing_ratio) * output['sent_loss']
             else:
                 if hasattr(self.args, 'question_type_classification_head') and \
@@ -1093,7 +1087,7 @@ class HotpotModel(pl.LightningModule):
                     json.dump(metrics, f_out)
                 print(json.dumps(metrics, indent=2))
                 print('\t'.join(['em', 'f1', 'sp_em', 'sp_f1', 'joint_em', 'joint_f1']))
-                print('\t'.join([metrics['em'], metrics['f1'], metrics['sp_em'], metrics['sp_f1'], metrics['joint_em'], metrics['joint_f1']]))
+                print('\t'.join([str(metrics['em']), str(metrics['f1']), str(metrics['sp_em']), str(metrics['sp_f1']), str(metrics['joint_em']), str(metrics['joint_f1'])]))
             with open(self.args.test_output_dir + '/related-sentence-index.json', 'w') as f_out:
                 json.dump(related_sent_index, f_out)
             with open(predictions_file, 'w') as f_out:
@@ -1139,11 +1133,11 @@ class HotpotModel(pl.LightningModule):
             gpu_count = max(self.args.total_gpus, 1)
             grad_accum_steps = self.args.batch_size if self.args.model_type == 'longformer' else self.args.grad_accum  # This model doesn't work with batch size greater than 1
             if self.args.model_type == 'tvm_roberta' or self.args.model_type == 'longformer':
-                self.roberta.args.total_num_update = (self.args.num_epochs * self.args.dataset_size / self.args.batch_size / gpu_count)
+                self.args.total_num_updates = (self.args.num_epochs * self.args.dataset_size / self.args.batch_size / gpu_count)
             else:
-                self.roberta.args.total_num_update = (self.args.num_epochs * self.args.dataset_size / self.args.grad_accum / gpu_count)
+                self.args.total_num_updates = (self.args.num_epochs * self.args.dataset_size / self.args.grad_accum / gpu_count)
             print(f'\n\n-------\n effective batch size: {gpu_count * 1 * grad_accum_steps}\n'
-                f'total num updates: {self.roberta.args.total_num_update}\n\n----\n')
+                f'total num updates: {self.args.total_num_updates}\n\n----\n')
             self.roberta.args.power = 1.0
             self.scheduler = build_lr_scheduler(self.roberta.args, optimizer)
 
@@ -1161,14 +1155,14 @@ class HotpotModel(pl.LightningModule):
         elif self.args.optimizer_type == 'adam':
             grad_accum_steps = self.args.batch_size  # This model doesn't work with batch size greater than 1
             gpu_count = max(self.args.total_gpus, 1)
-            self.roberta.args.total_num_update = (self.args.num_epochs * self.args.dataset_size / self.args.batch_size / gpu_count)
+            self.args.total_num_updates = (self.args.num_epochs * self.args.dataset_size / self.args.batch_size / gpu_count)
             print(f'\n\n-------\n effective batch size: {gpu_count * 1 * grad_accum_steps}\n'
-                f'total num updates: {self.roberta.args.total_num_update}\n\n----\n')
+                f'total num updates: {self.args.total_num_updates}\n\n----\n')
 
             def lr_lambda(current_step):
                 if current_step < self.args.warmup:
                     return float(current_step) / float(max(1, self.args.warmup))
-                return max(0.0, float(self.roberta.args.total_num_update - current_step) / float(max(1, self.roberta.args.total_num_update - self.args.warmup)))
+                return max(0.0, float(self.args.total_num_updates - current_step) / float(max(1, self.args.total_num_updates - self.args.warmup)))
             optimizer = torch.optim.Adam(self.parameters(), lr=self.args.lr)
             self.scheduler = LambdaLR(optimizer, lr_lambda, last_epoch=-1)  # scheduler is not saved in the checkpoint, but global_step is, which is enough to restart
             self.scheduler.step(self.global_step / self.hparams.batch_size)
@@ -1232,7 +1226,7 @@ class HotpotModel(pl.LightningModule):
 
         parser.add_argument("--model-type", type=str, required=True)
         parser.add_argument("--model-path", type=str, required=True)
-        parser.add_argument("--model-filename", type=str, required=True)
+        parser.add_argument("--model-filename", type=str, required=False, help='if loading roberta')
 
         parser.add_argument("--num-gpus", type=str, default=1)
         parser.add_argument("--batch-size", type=int, default=32, help="Batch size per GPU")
@@ -1286,8 +1280,8 @@ class HotpotModel(pl.LightningModule):
         parser.add_argument("--fancy-decode", default=False, action='store_true')
         parser.add_argument("--simple-sentence-decode", default=False, action='store_true')
         parser.add_argument("--overrides", default=None, help='override model args when loading a checkpoint, a json string')
+        parser.add_argument("--attention-mode", choices={'n2', 'tvm', 'sliding_chunks'}, default='sliding_chunks')
 
-        parser.add_argument("--attn-impl", type=str, choices={'tvm', 'sliding_chunks'}, default='sliding_chunks')
         parser.add_argument("--fp32", action='store_true', help="default is fp16. Use --fp32 to switch to fp32")
         parser.add_argument("--optimizer-type", choices={'fairseq_optimizer', 'adam'}, default='adam')
 
@@ -1311,7 +1305,7 @@ def main(args):
 
     if args.test_only:
         print('loading model...')
-        overrides = {'model_path': args.model_path, 'model_filename': args.model_filename, 'num_gpus': args.num_gpus, 'total_gpus': args.total_gpus}
+        overrides = {'model_path': args.model_path, 'num_gpus': args.num_gpus, 'total_gpus': args.total_gpus}
         print(overrides)
         if args.overrides:
             for k, v in json.loads(args.overrides).items():
@@ -1320,10 +1314,11 @@ def main(args):
             args.test_checkpoint,
             overrides=overrides
         )
+        model.args = args
         model.args.num_gpus = args.num_gpus  # TODO: add support for ddp in test
         model.args.total_gpus = args.total_gpus
-        model.args = args
         model.args.attention_window = 256  # ugly hack, when loading the model from pretrained the attention window is not loaded, need to manually set
+        model.args.attention_mode = 'sliding_chunks'
         model.args.dev_file = args.dev_file
         model.args.test_file = args.dev_file
         model.args.train_file = args.dev_file  # the model won't get trained, pass in the dev file instead to load faster
