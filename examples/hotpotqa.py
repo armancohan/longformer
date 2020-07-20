@@ -29,7 +29,11 @@ from torch.utils.data.dataset import Dataset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 
-from apex import amp
+try:
+    from apex import amp
+except ImportError:
+    from torch.cuda import amp
+
 from hotpotqa_utils.hotpot_eval import exact_match_score
 from hotpotqa_utils.hotpot_eval import f1_score as hotpot_f1_score
 from hotpotqa_utils.hotpot_eval import hotpot_evaluate, sp_metrics
@@ -413,23 +417,23 @@ class HotpotModel(pl.LightningModule):
 
         # load the state_dict on the model automatically
         model = cls(hparams)
-        model.load_state_dict(checkpoint['state_dict'])
+        # model.load_state_dict(checkpoint['state_dict'])
 
         # give model a chance to load something
         model.on_load_checkpoint(checkpoint)
 
         return model
 
-    def backward(self, use_amp, loss, optimizer):
-        if self.args.fp16 and self.args.optimizer_type == 'fairseq_optimizer':
-            # using fairseq optimizer, this is how it is done
-            optimizer.backward(loss)
-        else:
-            if use_amp:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-            else:
-                loss.backward()
+    # def backward(self, use_amp, loss, optimizer):
+    #     if self.args.fp16 and self.args.optimizer_type == 'fairseq_optimizer':
+    #         # using fairseq optimizer, this is how it is done
+    #         optimizer.backward(loss)
+    #     else:
+    #         if use_amp:
+    #             with amp.scale_loss(loss, optimizer) as scaled_loss:
+    #                 scaled_loss.backward()
+    #         else:
+    #             loss.backward()
 
     def or_softmax_cross_entropy_loss_one_doc(self, logits, target, ignore_index=-1, dim=-1):
         """loss function suggested in section 2.2 here https://arxiv.org/pdf/1710.10723.pdf"""
@@ -1024,7 +1028,7 @@ class HotpotModel(pl.LightningModule):
             orig_doc_tokens = self.test_dataloader_obj.dataset[_int_qid][16]
             answers, supporting_facts, related_sentence_index, sentence_to_score = self.decode(
                 _input_id, _start_logit, _end_logit, _q_len, _sent_logit, _par_logit, _type_logit, pars, sent_to_par_idx, 
-                simple_sentence_decode=False, fancy_span_decode=self.args.fancy_decode, orig_doc_tokens=orig_doc_tokens,
+                simple_sentence_decode=args.simple_sentence_decode, fancy_span_decode=self.args.fancy_decode, orig_doc_tokens=orig_doc_tokens,
                 token_to_orig_map=token_to_orig_map
             )
             par_score = _par_logit[:, 1].tolist()
@@ -1347,14 +1351,17 @@ def main(args):
         else:
             monitor_metric = 'avg_combined_f1'
 
+
+        ckpt_filepath = f"{args.save_dir}/{logger.name}/version_{logger.version}/checkpoints"
         checkpoint_callback = ModelCheckpoint(
             # model saved to filepath/prefix_....
-            filepath=f'{args.save_dir}/{logger.name}/version_{logger.version}/checkpoints',
+            filepath= ckpt_filepath + '/{epoch:02d}-{avg_combined_f1:.3f}-{avg_sent_f1:.3f}-{avg_val_em:.3f}',
             prefix='',
             save_top_k=3,
             verbose=True,
             monitor=monitor_metric,
             mode='max',
+            period=-1
         )
 
         if args.initialize_from_checkpoint:
