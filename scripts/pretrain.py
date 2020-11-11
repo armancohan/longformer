@@ -318,6 +318,7 @@ class Pretrainer(ptl.LightningModule):
         parser.add_argument("--process_spawn_delay", type=int, default=0)
 
         parser.add_argument("--resize_token_embeddings", default=False, action='store_true', help='used for s2 data with additional vocabulary.')
+        parser.add_argument("--num_skip_batches", type=int, default=None, help='skip N batches, used for resuming a checkpoint')
 
         return parser
 
@@ -431,6 +432,7 @@ def main(args):
         num_sanity_val_steps=2,
         val_percent_check=args.val_percent_check,
         delay_start_process=args.process_spawn_delay,
+        num_skip_batches=args.num_skip_batches
         # reload_dataloaders_every_epoch=True
     )
     trainer.fit(pretrainer)
