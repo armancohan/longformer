@@ -148,7 +148,7 @@ class Pretrainer(ptl.LightningModule):
         self.start_time = time.time()
         if self.on_gpu:
             tensorboard_logs['memory'] = torch.cuda.memory_allocated(loss.device) / 1024 ** 3
-        return {'loss': loss, 'log': tensorboard_logs}
+        return {'loss': loss, 'log': tensorboard_logs, 'progress_bar': {'lr': lr}}
 
     def validation_step(self, batch, batch_nb):
         # TODO: log how long evaluation takes
