@@ -231,54 +231,6 @@ class Pretrainer(ptl.LightningModule):
     def val_dataloader(self):
         return self._get_loader(f'{self.args.input_dir}/val.bin', True)
 
-    def restore_training_state(self, checkpoint):
-        """
-        Restore trainer state.
-        Model will get its change to update
-        :param checkpoint:
-        :return:
-        """
-        if self.checkpoint_callback is not None and self.checkpoint_callback is not False:
-            self.checkpoint_callback.best = checkpoint['checkpoint_callback_best']
-
-        if self.early_stop_callback is not None and self.early_stop_callback is not False:
-            self.early_stop_callback.wait = checkpoint['early_stop_callback_wait']
-            self.early_stop_callback.patience = checkpoint['early_stop_callback_patience']
-
-        self.global_step = checkpoint['global_step']
-        self.current_epoch = checkpoint['epoch']
-
-        # Division deals with global step stepping once per accumulated batch
-        # Inequality deals with different global step for odd vs even num_training_batches
-        n_accum = 1 if self.accumulate_grad_batches is None else self.accumulate_grad_batches
-        expected_steps = self.num_training_batches / n_accum
-        if self.num_training_batches != 0 and self.global_step % expected_steps > 1:
-            rank_zero_warn(
-                "You're resuming from a checkpoint that ended mid-epoch. "
-                "This can cause unreliable results if further training is done, "
-                "consider using an end of epoch checkpoint. "
-            )
-
-        # restore the optimizers
-        if not getattr(args, 'ignore_optim_state', False):
-            optimizer_states = checkpoint['optimizer_states']
-            for optimizer, opt_state in zip(self.optimizers, optimizer_states):
-                optimizer.load_state_dict(opt_state)
-
-                # move optimizer to GPU 1 weight at a time
-                # avoids OOM
-                if self.root_gpu is not None:
-                    for state in optimizer.state.values():
-                        for k, v in state.items():
-                            if isinstance(v, torch.Tensor):
-                                state[k] = v.cuda(self.root_gpu)
-
-        # restore the lr schedulers
-        if not getattr(args, 'ignore_lr_state', False):
-            lr_schedulers = checkpoint['lr_schedulers']
-            for scheduler, lrs_state in zip(self.lr_schedulers, lr_schedulers):
-                scheduler['scheduler'].load_state_dict(lrs_state)        
-
     def grad_norm(self, norm_type):
         # Override PTL `grad_norm` function to only return `total_grad_norm` instead norms of individual params
         # TODO: grad_norm reporting needs to take fp16 loss scale into account
@@ -426,6 +378,53 @@ class MLM_Trainer(ptl.Trainer):
             torch.save(checkpoint, tmp_path)
             os.replace(tmp_path, filepath)
 
+    def restore_training_state(self, checkpoint):
+        """
+        Restore trainer state.
+        Model will get its change to update
+        :param checkpoint:
+        :return:
+        """
+        if self.checkpoint_callback is not None and self.checkpoint_callback is not False:
+            self.checkpoint_callback.best = checkpoint['checkpoint_callback_best']
+
+        if self.early_stop_callback is not None and self.early_stop_callback is not False:
+            self.early_stop_callback.wait = checkpoint['early_stop_callback_wait']
+            self.early_stop_callback.patience = checkpoint['early_stop_callback_patience']
+
+        self.global_step = checkpoint['global_step']
+        self.current_epoch = checkpoint['epoch']
+
+        # Division deals with global step stepping once per accumulated batch
+        # Inequality deals with different global step for odd vs even num_training_batches
+        n_accum = 1 if self.accumulate_grad_batches is None else self.accumulate_grad_batches
+        expected_steps = self.num_training_batches / n_accum
+        if self.num_training_batches != 0 and self.global_step % expected_steps > 1:
+            rank_zero_warn(
+                "You're resuming from a checkpoint that ended mid-epoch. "
+                "This can cause unreliable results if further training is done, "
+                "consider using an end of epoch checkpoint. "
+            )
+
+        # restore the optimizers
+        if not getattr(args, 'ignore_optim_state', False):
+            optimizer_states = checkpoint['optimizer_states']
+            for optimizer, opt_state in zip(self.optimizers, optimizer_states):
+                optimizer.load_state_dict(opt_state)
+
+                # move optimizer to GPU 1 weight at a time
+                # avoids OOM
+                if self.root_gpu is not None:
+                    for state in optimizer.state.values():
+                        for k, v in state.items():
+                            if isinstance(v, torch.Tensor):
+                                state[k] = v.cuda(self.root_gpu)
+
+        # restore the lr schedulers
+        if not getattr(args, 'ignore_lr_state', False):
+            lr_schedulers = checkpoint['lr_schedulers']
+            for scheduler, lrs_state in zip(self.lr_schedulers, lr_schedulers):
+                scheduler['scheduler'].load_state_dict(lrs_state)        
 
 
 def main(args):
