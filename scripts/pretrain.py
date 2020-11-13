@@ -329,6 +329,8 @@ class MLM_Trainer(ptl.Trainer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.ignore_lr_state = kwargs.get('ignore_lr_state', False)
+        self.ignore_optim_state = kwargs.get('ignore_optim_state', False)
 
     def save_checkpoint(self, filepath):
         def _do_save(chkpt):
@@ -405,9 +407,8 @@ class MLM_Trainer(ptl.Trainer):
                 "This can cause unreliable results if further training is done, "
                 "consider using an end of epoch checkpoint. "
             )
-
         # restore the optimizers
-        if not getattr(args, 'ignore_optim_state', False):
+        if not getattr(self, 'ignore_optim_state', False):
             optimizer_states = checkpoint['optimizer_states']
             for optimizer, opt_state in zip(self.optimizers, optimizer_states):
                 optimizer.load_state_dict(opt_state)
@@ -421,7 +422,7 @@ class MLM_Trainer(ptl.Trainer):
                                 state[k] = v.cuda(self.root_gpu)
 
         # restore the lr schedulers
-        if not getattr(args, 'ignore_lr_state', False):
+        if not getattr(self, 'ignore_lr_state', False):
             lr_schedulers = checkpoint['lr_schedulers']
             for scheduler, lrs_state in zip(self.lr_schedulers, lr_schedulers):
                 scheduler['scheduler'].load_state_dict(lrs_state)        
@@ -482,7 +483,9 @@ def main(args):
         num_sanity_val_steps=2,
         val_percent_check=args.val_percent_check,
         delay_start_process=args.process_spawn_delay,
-        num_skip_batches=args.num_skip_batches
+        num_skip_batches=args.num_skip_batches,
+        ignore_optim_state=args.ignore_optim_state,
+        ignore_lr_state=args.ignore_lr_state
         # reload_dataloaders_every_epoch=True
     )
     trainer.fit(pretrainer)
