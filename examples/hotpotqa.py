@@ -16,7 +16,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from pytorch_lightning import LightningModule, Trainer, data_loader
+from pytorch_lightning import LightningModule, Trainer
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.logging import TestTubeLogger
 from pytorch_lightning.overrides.data_parallel import (
@@ -119,6 +119,7 @@ def custom_collate(batch):
     # 14 'q_type'
     # 15 'token_to_orig_map'
     # 16 'orig_doc_tokens'
+    # 17 'entity_attention'    
 
     transposed = zip(*batch)
     lst = []
@@ -142,7 +143,7 @@ def custom_collate(batch):
                 sent_lens = lengths
             if i == 13:
                 par_lens = lengths
-        elif i in {3, 4, 7, 8, 14}:
+        elif i in {3, 4, 7, 8, 14, 17}:
             out = None
             elem = samples[0]
             if torch.utils.data.get_worker_info() is not None:
@@ -203,6 +204,7 @@ class HotpotDataset(Dataset):
     # 10 'sent_idx': list(zip(sent_indices_start, sent_indices_end)),
     # 11 'par_idx': list(zip(par_indices_start, par_indices_end)),
     # 12 'sent_to_par_idx': sent_to_par_index
+    # 13 'entity_attention'
 
         # list of wordpiece tokenized candidates
         q_token_ids = self._tokenizer.convert_tokens_to_ids(instance['q_tokens'])
@@ -225,7 +227,8 @@ class HotpotDataset(Dataset):
                 torch.tensor(instance.get('par_labels')),
                 torch.tensor(q_type),
                 instance.get('token_to_orig_map') if not self.is_train else 0,
-                instance.get('orig_doc_tokens') if not self.is_train else 0)
+	            instance.get('orig_doc_tokens') if not self.is_train else 0,
+                torch.tensor(instance.get('entity_attention') or []))
 
 
 def mlp_classification_head(input_dim, hidden_dim, output_dim, activation='gelu'):
@@ -236,7 +239,7 @@ def mlp_classification_head(input_dim, hidden_dim, output_dim, activation='gelu'
     )
 
 
-def get_activations(model, q_ids, doc_ids, max_seq_len, kwargs, extra_attn, symmetric_extra_attention, attention_step, use_segment_ids, sent_token_id, model_type, par_token_id=None, pad_token_id=None, attention_window=None):
+def get_activations(model, q_ids, doc_ids, max_seq_len, kwargs, extra_attn, symmetric_extra_attention, attention_step, use_segment_ids, sent_token_id, model_type, par_token_id=None, pad_token_id=None, attention_window=None, entity_attention=None):
     q_len = q_ids.shape[1]
     doc_len = doc_ids.shape[1]
 
@@ -255,6 +258,9 @@ def get_activations(model, q_ids, doc_ids, max_seq_len, kwargs, extra_attn, symm
         if par_token_id is not None:
             par_mask = token_ids == par_token_id # paragraph start location
             sentence_mask = par_mask | sentence_mask
+        if entity_attention is not None:
+            entity_attention = torch.cat([q_ids.new_zeros(q_ids.shape, dtype=bool), entity_attention.bool()], dim=1)
+            sentence_mask = entity_attention | sentence_mask
         extra_attention_mask = torch.zeros(token_ids.shape, dtype=torch.bool, device=token_ids.device)
         extra_attention_mask[sentence_mask] = 1  # attend to all sentences
         extra_attention_mask[:, :q_len] = 1  # attend to question tokens
@@ -287,6 +293,8 @@ def get_activations(model, q_ids, doc_ids, max_seq_len, kwargs, extra_attn, symm
             if par_token_id is not None:
                 par_mask = token_ids == par_token_id # paragraph start location
                 sentence_mask = par_mask | sentence_mask
+            if entity_attention is not None:
+                sentence_mask = entity_attention | sentence_mask
             extra_attention_mask = torch.zeros(token_ids.shape, dtype=torch.bool, device=token_ids.device)
             extra_attention_mask[sentence_mask] = 1  # attend to all sentences
             for i in range(token_ids.shape[0]):
@@ -470,7 +478,7 @@ class HotpotModel(pl.LightningModule):
         # it is easier to compute
         return loss[~torch.isinf(loss)].sum()
 
-    def forward(self, q_ids, q_len, doc_ids, sentence_labels=None, start_pos=None, end_pos=None, paragraph_labels=None, q_type_labels=None):
+    def forward(self, q_ids, q_len, doc_ids, sentence_labels=None, start_pos=None, end_pos=None, paragraph_labels=None, q_type_labels=None, entity_attention=None):
         """
         Args:
             q_ids: quesion token ids
@@ -495,7 +503,8 @@ class HotpotModel(pl.LightningModule):
             model_type=self.args.model_type,
             par_token_id=self.par_token_id if self.args.include_paragraph else None,
             pad_token_id=self._tokenizer.pad_token_id,
-            attention_window=self.args.attention_window)
+            attention_window=self.args.attention_window,
+            entity_attention=entity_attention if self.args.include_entities else None)
 
         if len(activations) > 1:
             # document has been broken into parts
@@ -630,9 +639,9 @@ class HotpotModel(pl.LightningModule):
 
     def training_step(self, batch, batch_nb):
 
-        q_id, q_tokens, doc_tokens, start_pos, end_pos, answer_str, sent_labels, num_sents, num_pars, pars, sent_idx, par_idx, sent_to_par_idx, par_labels, q_type_label, token_to_orig_map, orig_doc_tokens, q_lens, doc_lens, sent_lens, par_lens = batch
+        q_id, q_tokens, doc_tokens, start_pos, end_pos, answer_str, sent_labels, num_sents, num_pars, pars, sent_idx, par_idx, sent_to_par_idx, par_labels, q_type_label, token_to_orig_map, orig_doc_tokens, entity_attention, q_lens, doc_lens, sent_lens, par_lens = batch
         n_batch = len(q_tokens)
-        output = self.forward(q_tokens, q_lens.max(), doc_tokens, sent_labels, start_pos, end_pos, par_labels, q_type_label)
+        output = self.forward(q_tokens, q_lens.max(), doc_tokens, sent_labels, start_pos, end_pos, par_labels, q_type_label, entity_attention=entity_attention)
 
         if self.args.linear_mixing is None:
             if hasattr(self.args, 'question_type_classification_head') and self.args.question_type_classification_head:
@@ -675,10 +684,10 @@ class HotpotModel(pl.LightningModule):
 
     def _validation_step(self, batch, batch_number):
         global dev_json_cache
-        q_id, q_tokens, doc_tokens, start_pos, end_pos, answer_str, sent_labels, num_sents, num_pars, pars, sent_idx, par_idx, sent_to_par_idx, par_labels, q_type_label, token_to_orig_map, orig_doc_tokens, q_lens, doc_lens, sent_lens, par_lens = batch
+        q_id, q_tokens, doc_tokens, start_pos, end_pos, answer_str, sent_labels, num_sents, num_pars, pars, sent_idx, par_idx, sent_to_par_idx, par_labels, q_type_label, token_to_orig_map, orig_doc_tokens, entity_attention, q_lens, doc_lens, sent_lens, par_lens = batch
         n_batch = len(q_tokens)
         assert n_batch == 1  # doesn't currently support larger batch size
-        output = self.forward(q_tokens, q_lens.max(), doc_tokens, sent_labels, start_pos, end_pos, par_labels, q_type_label)
+        output = self.forward(q_tokens, q_lens.max(), doc_tokens, sent_labels, start_pos, end_pos, par_labels, q_type_label, entity_attention=entity_attention)
 
         if self.args.linear_mixing is None:
             if self.args.dynamic_mixing_ratio:
@@ -968,11 +977,11 @@ class HotpotModel(pl.LightningModule):
             yield s
 
     def test_step(self, batch, batch_nb):
-        q_id, q_tokens, doc_tokens, start_pos, end_pos, answer_str, sent_labels, num_sents, num_pars, pars, sent_idx, par_offsets, sent_to_par_idx, par_labels, q_type_label, token_to_orig_map, orig_doc_tokens, q_lens, doc_lens, sent_lens, par_lens = batch
+        q_id, q_tokens, doc_tokens, start_pos, end_pos, answer_str, sent_labels, num_sents, num_pars, pars, sent_idx, par_offsets, sent_to_par_idx, par_labels, q_type_label, token_to_orig_map, orig_doc_tokens, entity_attention, q_lens, doc_lens, sent_lens, par_lens = batch
         n_batch = len(q_tokens)
         assert n_batch == 1  # doesn't currently support larger batch size
         assert len(sent_to_par_idx) == 1
-        output = self.forward(q_tokens, q_lens.max(), doc_tokens, sent_labels, start_pos, end_pos, par_labels, q_type_label)
+        output = self.forward(q_tokens, q_lens.max(), doc_tokens, sent_labels, start_pos, end_pos, par_labels, q_type_label, entity_attention=entity_attention)
         sent_logits = output['sent_logits']
         start_logits = output['start_logits']
         end_logits = output['end_logits']
@@ -1200,20 +1209,15 @@ class HotpotModel(pl.LightningModule):
                 dataset, batch_size=batch_size, shuffle=is_train, num_workers=self.args.num_workers, collate_fn=custom_collate)
         return loader
 
-
-    @data_loader
     def train_dataloader(self):
         return self._get_loader('train')
 
-    @data_loader
     def val_dataloader(self):
         if self.val_dataloader_obj is not None:
             return self.val_dataloader_obj
         self.val_dataloader_obj = self._get_loader('dev')
         return self.val_dataloader_obj
 
-
-    @data_loader
     def test_dataloader(self):
         if self.test_dataloader_obj is not None:
             return self.test_dataloader_obj
@@ -1288,6 +1292,8 @@ class HotpotModel(pl.LightningModule):
 
         parser.add_argument("--fp32", action='store_true', help="default is fp16. Use --fp32 to switch to fp32")
         parser.add_argument("--optimizer-type", choices={'fairseq_optimizer', 'adam'}, default='adam')
+
+        parser.add_argument("--include-entities", default=False, action='store_true')
 
         return parser
 
