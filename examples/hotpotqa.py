@@ -18,7 +18,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from pytorch_lightning import LightningModule, Trainer
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
-from pytorch_lightning.logging import TestTubeLogger
 from pytorch_lightning.overrides.data_parallel import (
     LightningDataParallel, LightningDistributedDataParallel)
 from torch._six import container_abcs, int_classes, string_classes
@@ -28,6 +27,8 @@ from torch.utils.data.dataloader import DataLoader
 from torch.utils.data.dataset import Dataset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
+
+from pytorch_lightning import loggers as pl_loggers
 
 try:
     from apex import amp
@@ -1197,11 +1198,11 @@ class HotpotModel(pl.LightningModule):
         dataset = HotpotDataset(fname, max_seq_len=self.args.max_seq_len, num_samples=self.args.num_samples, split=split)
 
         if self.args.total_gpus > 1:
-            sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True)
+            # sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True)
             batch_size = self.args.batch_size if self.args.model_type == 'roberta' else 1
             loader = DataLoader(
                 dataset, batch_size=batch_size, num_workers=self.args.num_workers,
-                sampler=sampler, collate_fn=custom_collate)
+                collate_fn=custom_collate)
         else:
             # batch size should be 1, we accumulate gradients
             batch_size = self.args.batch_size if self.args.model_type == 'roberta' else 1
@@ -1342,7 +1343,7 @@ def main(args):
         # logger here is a SummaryWritter for tensorboard
         # it is used by the trainer, and certain return variables
         # from the model are automatically logged
-        logger = TestTubeLogger(
+        logger = pl_loggers.TensorBoardLogger(
             save_dir=args.save_dir,
             name=args.save_prefix,
             version=args.version
@@ -1390,7 +1391,7 @@ def main(args):
                             val_percent_check=args.val_percent_check,
                             checkpoint_callback=checkpoint_callback,
                             resume_from_checkpoint=args.resume_from_checkpoint,
-                            use_amp=not args.fp32, amp_level='O2')
+                            precision=16 if not args.fp32 else 32)
 
         trainer.fit(model)
 
