@@ -23,8 +23,13 @@ from collections import defaultdict
 from functools import lru_cache
 from multiprocessing.pool import Pool
 import re
+import spacy
+from spacy.tokens import Doc
+import string
 
 from tqdm.auto import tqdm
+
+_spacy_nlp = None
 
 # tokens from gpt2 vocab
 # Q_START = 'madeupword0000'
@@ -37,6 +42,8 @@ TITLE_END = '</t>'
 SENT_MARKER = '[sent]'
 SENT_MARKER_END = '[/sent]'
 PAR = '[/par]'
+DOC_START = '<doc-s>'
+DOC_END = '</doc-s>'
 
 def normalize_string(s):
     s = s.replace(' .', '.')
@@ -65,6 +72,33 @@ def normalize_answer(s):
         return text.lower()
 
     return white_space_fix(remove_articles(remove_punc(lower(s))))
+
+
+class WhitespaceTokenizer(object):
+    # custom tokenizer for spacy pipeline
+    def __init__(self, vocab):
+        self.vocab = vocab
+    def __call__(self, text):
+        def is_whitespace(c):
+            if c == " " or c == "\t" or c == "\r" or c == "\n" or ord(c) == 0x202F:
+                return True
+            return False
+        # special tokenization to find answer spans in the doc
+        # first whitespace tokenize and then tokenize each word using bpe
+        doc_tokens = []
+        char_to_word_offset = []
+        prev_is_whitespace = True
+        for c in text:
+            if is_whitespace(c):
+                prev_is_whitespace = True
+            else:
+                if prev_is_whitespace:
+                    doc_tokens.append(c)
+                else:
+                    doc_tokens[-1] += c
+                prev_is_whitespace = False
+        spaces = [True] * len(doc_tokens)
+        return Doc(self.vocab, words=doc_tokens, spaces=spaces)
 
 
 def find_string_in_wordpieces(word_pieces, s, tokenizer, lowercase=False):
@@ -281,11 +315,15 @@ def _improve_answer_span(doc_tokens, input_start, input_end, tokenizer, orig_ans
     return (input_start, input_end)
 
 
-def process_instance_for_support_prediction(instance, max_sents, max_tokens, shorten_long_context, train, include_answer, ignore_par_title, new_version):
+def process_instance_for_support_prediction(instance, max_sents, max_tokens, shorten_long_context, train, include_answer,
+                                            ignore_par_title, new_version, add_doc_separators, add_bos_token,
+                                            process_ner):
     """
     Creates a long context of form
     <sep> q q q </sep> s1 s1 s1 </sent> s2 s2 s2 </sent> ....
     """
+    global _spacy_nlp
+
     def is_whitespace(c):
         if c == " " or c == "\t" or c == "\r" or c == "\n" or ord(c) == 0x202F:
             return True
@@ -332,13 +370,17 @@ def process_instance_for_support_prediction(instance, max_sents, max_tokens, sho
         par_dict = {}
         if supporting_facts is not None:
             par_dict['is_relevant'] = 1 if par[0] in supporting_facts else 0
+
         title_str = TITLE_START + ' ' + par[0] + ' ' + TITLE_END + ' '
         par_dict['title'] = title_str
         par_dict['sentences'] = []
         par_dict['sentence_labels'] = []
         for j, sent in enumerate(par[1]):
             sent_to_par_index[sent_cnt] = {'par': i, 'sent': j, 'par_title': par[0]}
-            sent_str = sent + ' ' + SENT_MARKER_END
+            if add_bos_token:
+                sent_str = SENT_MARKER + ' ' + sent + ' ' + SENT_MARKER_END
+            else:
+                sent_str = sent + ' ' + SENT_MARKER_END
             par_dict['sentences'].append(sent_str)
             if supporting_facts is not None:
                 try:
@@ -364,6 +406,8 @@ def process_instance_for_support_prediction(instance, max_sents, max_tokens, sho
     # create the document string
     for p in paragraph_sents:
         # add title
+        if add_doc_separators:
+            document_str += DOC_START
         document_str += ' ' + p['title']
         # add sentences
         if p.get('sentence_labels'):
@@ -375,6 +419,8 @@ def process_instance_for_support_prediction(instance, max_sents, max_tokens, sho
             for sent in p['sentences']:
                 sent_cnt += 1
                 document_str += sent
+        if add_doc_separators:
+            document_str += DOC_END
 
     if supporting_facts is not None:
         relevant_par_idx = [i for i, e in enumerate(paragraph_sents) if e['is_relevant'] == 1]
@@ -383,7 +429,8 @@ def process_instance_for_support_prediction(instance, max_sents, max_tokens, sho
         par_labels = []
 
     # include additional `null yes no` tokens
-    additional_str = ' ' + PAR + ' null yes no' + tokenizer.sep_token
+    # additional_str = ' ' + PAR + ' null yes no' + tokenizer.sep_token
+    additional_str = tokenizer.sep_token
     document_str += additional_str
 
     if sentence_labels:
@@ -465,9 +512,42 @@ def process_instance_for_support_prediction(instance, max_sents, max_tokens, sho
             prev_is_whitespace = False
         char_to_word_offset.append(len(doc_tokens) - 1)
 
+	if _spacy_nlp is None and process_ner:
+        print('loading spacy')
+        # spacy.prefer_gpu()
+        _spacy_nlp = spacy.load("en_core_web_md")
+        # _spacy_nlp.tokenizer = WhitespaceTokenizer(_spacy_nlp.vocab)
+    entity_set = set()
+    if process_ner:
+        entity_locations = []
+        entity_locations_char = []
+        doc = _spacy_nlp(document_str)
+        # assert len(doc) == len(doc_tokens)
+        for ent in doc.ents:
+            for loc in range(ent.start, ent.end):
+                if ent.text not in [Q_START, Q_END, TITLE_START, TITLE_END, SENT_MARKER_END, SENT_MARKER, PAR]:
+                    entity_locations.append(loc)
+                entity_set.add(ent.text)
+            entity_locations_char.append([ent.start_char, ent.end_char])
+    else:
+        entity_locations = []
+        entity_locations_char = []
+
+    if instance.get('answer') and process_ner:
+        if instance.get('answer') in entity_set:
+            covered_by_entity = 1
+        else:
+            covered_by_entity = 0
+    else:
+        covered_by_entity = 0
+
+
     tok_to_orig_index = []
     orig_to_tok_index = []
     all_doc_tokens = []
+    entity_attention = []
+    entity_locations_set = set(entity_locations)
+    sub_token_counter = 0
     for (i, token) in enumerate(doc_tokens):
         orig_to_tok_index.append(len(all_doc_tokens))
         # ugly hack: the line below should have been `self.tokenizer.tokenize(token')`
@@ -478,6 +558,13 @@ def process_instance_for_support_prediction(instance, max_sents, max_tokens, sho
         for sub_token in sub_tokens:
             tok_to_orig_index.append(i)
             all_doc_tokens.append(sub_token)
+	        if i in entity_locations_set:
+                entity_attention.append(1)
+            else:
+                entity_attention.append(0)
+            sub_token_counter += 1
+    assert len(entity_attention)  == sub_token_counter == len(all_doc_tokens)
+
 
     if instance.get('answer') and train:
         final_spans = [_improve_answer_span(all_doc_tokens, e[0], e[1], tokenizer, instance['answer']) for e in final_spans]
@@ -514,12 +601,27 @@ def process_instance_for_support_prediction(instance, max_sents, max_tokens, sho
     else:
         start_positions = end_positions = []
 
+	if process_ner:
+        ner_spans = []
+        is_entity = [False for _ in range(len(all_doc_tokens))]
+        for ner_char_offset_start, ner_char_offset_end in entity_locations_char:
+            start_pos = char_to_word_offset[ner_char_offset_start]
+            end_position = char_to_word_offset[min(ner_char_offset_end - 1, len(char_to_word_offset) - 1)]
+            tok_start_position_in_doc = orig_to_tok_index[start_pos]
+            not_end_of_doc = int(end_position + 1 < len(orig_to_tok_index))
+            tok_end_position_in_doc = orig_to_tok_index[end_position + not_end_of_doc] - not_end_of_doc
+            ner_spans.append((tok_start_position_in_doc, tok_end_position_in_doc))
+            for offset_ in range(tok_start_position_in_doc, tok_end_position_in_doc + 1):
+                is_entity[offset_] = True
+    else:
+        is_entity = []
+
     # if len(all_doc_tokens) > max_tokens:
     #     print(f'document long even after shortening {len(all_doc_tokens)}, discarding the example')
     #     return None
     if not start_positions and train:
         print('no answer found, skipping')
-        return None
+        return None, None
 
     token_to_orig_map = {}
     for i in range(len(all_doc_tokens)):
@@ -542,9 +644,10 @@ def process_instance_for_support_prediction(instance, max_sents, max_tokens, sho
            'par_idx': list(zip(par_indices_start, par_indices_end)),
            'sent_to_par_idx': sent_to_par_index,
            'token_to_orig_map': token_to_orig_map,
-           'orig_doc_tokens': doc_tokens
+           'orig_doc_tokens': doc_tokens,
+           'entity_attention': is_entity
     }
-    return obj
+    return obj, covered_by_entity
 
 
 def _find_answer_in_context(context, answer, tokenizer):
@@ -556,9 +659,13 @@ def _find_answer_in_context(context, answer, tokenizer):
     return idx
 
 
-def process_instance(instance, max_sents, max_tokens, shorten_long_context, train, include_answer, ignore_par_title, new_version):
-    processed = process_instance_for_support_prediction(instance, max_sents, max_tokens, shorten_long_context=shorten_long_context, train=train, include_answer=include_answer, ignore_par_title=ignore_par_title, new_version=new_version)
-    return processed
+def process_instance(instance, max_sents, max_tokens, shorten_long_context, train, include_answer,
+                     ignore_par_title, new_version, add_doc_separators, add_bos_token, process_entities):
+    processed = process_instance_for_support_prediction(
+        instance, max_sents, max_tokens, shorten_long_context=shorten_long_context,
+        train=train, include_answer=include_answer, ignore_par_title=ignore_par_title, new_version=new_version,
+        add_doc_separators=add_doc_separators, add_bos_token=add_bos_token, process_ner=process_entities)
+    return {'instance': processed, 'covered': covered}
 
 def tok(s):
     return get_roberta_tokenizer(100000000).tokenize(normalize_string(s), add_prefix_space=True)
@@ -590,12 +697,17 @@ def preprocess_hotpot(args):
         elif args.sentence_mode == 'tvm':
             process_fn = functools.partial(process_instance_for_support_prediction, max_sents=args.max_sents, max_tokens=args.max_tokens, include_answer=args.include_answer, ignore_par_title=args.ignore_par_title)
     else:
-        process_fn = functools.partial(process_instance, max_sents=args.max_sents, max_tokens=args.max_tokens, shorten_long_context=args.shorten_long_context, train=args.train, include_answer=args.include_answer, ignore_par_title=args.ignore_par_title, new_version=args.new_version)
+        process_fn = functools.partial(process_instance, max_sents=args.max_sents, max_tokens=args.max_tokens, shorten_long_context=args.shorten_long_context, train=args.train, include_answer=args.include_answer, ignore_par_title=args.ignore_par_title, new_version=args.new_version, add_doc_separators=args.add_doc_separators, add_bos_token=args.add_bos_token, process_entities=args.process_entities)
     if args.workers > 1:
         with Pool(args.workers) as p:
-            new_data = list(tqdm(p.imap(process_fn, data), total=len(data), unit_scale=1))
+            processed_results = list(tqdm(p.imap(process_fn, data), total=len(data), unit_scale=1))
     else:
-        new_data = [process_fn(d) for d in tqdm(data)]
+        processed_results = [process_fn(d) for d in tqdm(data)]
+
+	new_data = [e['instance'] for e in processed_results if e['instance'] is not None]
+    print(f'skipped: {len(processed_results) - len(new_data)} of {len(processed_results)}')
+    covered_by_entity = [e['covered'] for e in processed_results if e['covered'] is not None]
+    print(f"covered: {sum(covered_by_entity)}/{len(covered_by_entity)}: {sum(covered_by_entity)/len(covered_by_entity):.4f}")
 
     with open(args.output, 'w') as fout:
         for d in tqdm(new_data, desc='writing to file'):
@@ -616,10 +728,19 @@ def main():
     parser.add_argument('--train', default=False, action='store_true')
     parser.add_argument('--answer-prediction-file', default=None, help='`path`, default is None, if included the gold answer will be replace by the predicted answer spans')
     parser.add_argument('--ignore-par-title', default=False, action='store_true', help='do not include answer positions that are paragraph titles')
-    parser.add_argument('--new-version', default=False, action='store_true', help='a later version of preprocessing that has 1 end offset difference and the new decoding expects this.'
+    parser.add_argument('--no-bos-token', action='store_true', help='do not add <s> token')
+    parser.add_argument('--no-doc-sep', action='store_true', help='do not add document separators')
+    parser.add_argument('--no-entities', action='store_true', help='do not extract named entities')
+    parser.add_argument('--old-version', default=False, action='store_true', help='a later version of preprocessing that has 1 end offset difference and the new decoding expects this.'
+
                                                                                    'use this with newer model (model without spans in par titles)')
     random.seed(2)
     args = parser.parse_args()
+
+    args.add_bos_token = False if args.no_bos_tokens else True
+    args.add_doc_separators = False if args.no_doc_sep else True
+    args.new_version = False if args.old_version else True
+    args.process_ner = False if args.no_entities else True
 
     pathlib.Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     preprocess_hotpot(args)
