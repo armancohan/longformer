@@ -355,8 +355,8 @@ class HotpotModel(pl.LightningModule):
         self.sentence_loss = CrossEntropyLoss(ignore_index=-1)
         self.paragraph_loss = CrossEntropyLoss(ignore_index=-1)
         self.running_metrics = defaultdict(float)
-        self.sent_token_ids = self._tokenizer.convert_tokens_to_ids([SENT_MARKER_END])[0]
-        self.par_token_id = self._tokenizer.convert_tokens_to_ids([TITLE_END])[0]
+        self.sent_token_ids = self._tokenizer.convert_tokens_to_ids([SENT_MARKER])[0]
+        self.par_token_id = self._tokenizer.convert_tokens_to_ids([DOC_START])[0]
         self.val_dataloader_obj = None
         self.test_dataloader_obj = None
 
