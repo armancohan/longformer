@@ -27,6 +27,7 @@ from torch.utils.data.dataloader import DataLoader
 from torch.utils.data.dataset import Dataset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
+from sklearn import metrics
 
 from pytorch_lightning import loggers as pl_loggers
 
@@ -38,8 +39,8 @@ except ImportError:
 from hotpotqa_utils.hotpot_eval import exact_match_score
 from hotpotqa_utils.hotpot_eval import f1_score as hotpot_f1_score
 from hotpotqa_utils.hotpot_eval import hotpot_evaluate, sp_metrics
-from hotpotqa_utils.hotpot_prep import (SENT_MARKER_END, TITLE_END,
-                                        get_roberta_tokenizer)
+from hotpotqa_utils.hotpot_prep import (SENT_MARKER_END, TITLE_END, SENT_MARKER,
+                                        get_roberta_tokenizer, DOC_START, DOC_END)
 from hotpotqa_utils.hotpot_utils import get_final_text
 from longformer import sliding_chunks
 from longformer.longformer import Longformer
@@ -351,7 +352,12 @@ class HotpotModel(pl.LightningModule):
         self.signpost_interval = -1  # not used
         self.hparams = args
 
-        self._tokenizer = get_roberta_tokenizer()
+        if args.tokenizer_path is not None:
+            from transformers import AutoTokenizer 
+            # for cdlm
+            self._tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
+        else:
+            self._tokenizer = get_roberta_tokenizer()
 
         self._extract_features_args = {}
 
@@ -638,13 +644,13 @@ class HotpotModel(pl.LightningModule):
                 start_loss = loss_fct(start_logits, start_positions[:, 0])
                 end_loss = loss_fct(end_logits, end_positions[:, 0])
                             # top 1 accuracy
-            start_accuracy = (start_logits.argmax(dim=1)==start_positions).int().sum() / torch.tensor(start_logits.shape[0], dtype=torch.float32, device=start_logits.device)
-            end_accuracy = (end_logits.argmax(dim=1)==end_positions).int().sum() / torch.tensor(end_logits.shape[0], dtype=torch.float32, device=end_logits.device)
+            start_accuracy = (start_logits.argmax(dim=1)==start_positions).int().sum() / torch.tensor(start_logits.shape[1], dtype=torch.float32, device=start_logits.device)
+            end_accuracy = (end_logits.argmax(dim=1)==end_positions).int().sum() / torch.tensor(end_logits.shape[1], dtype=torch.float32, device=end_logits.device)
 
             span_loss = (start_loss + end_loss) / 2.0
         else:
             start_accuracy = end_accuracy = 0.0
-            span_loss = None
+            span_loss = 0.0
 
         output = {"span_loss": span_loss, "sent_loss": sentence_loss,
                   "start_logits": start_logits, "end_logits": end_logits,
@@ -677,6 +683,7 @@ class HotpotModel(pl.LightningModule):
             # sum the span level loss and support fact loss
             if self.args.dynamic_mixing_ratio:
                 # gradually increase mixing ratio to focus more on spans in later
+                raise NotImplementedError
                 mixing_ratio = self._num_grad_updates / self.args.total_num_updates
                 total_loss = mixing_ratio * span_loss + (1 - mixing_ratio) * output['sent_loss']
                 self.args.mixing_ratio = mixing_ratio
@@ -697,14 +704,16 @@ class HotpotModel(pl.LightningModule):
         tensorboard_logs = {'train_loss': total_loss, 'lr': lr, 'train_sent_acc': output['sent_accuracy'],
                             'train_sent_f1': output['sent_f1'], 'train_start_acc': output['start_accuracy'],
                             'train_span_loss': output['span_loss'], 'train_sent_loss': output['sent_loss'], 'mixing_ratio': self.args.mixing_ratio,
-                            'num_grad_updates': self._num_grad_updates,
                             'train_par_f1': output.get('paragraph_f1'), 'train_par_acc': output.get('paragraph_acc'),
                             'q_type_acc': output.get('q_type_acc'), 'q_type_loss': output.get('q_type_loss'),
                             'train_paragraph_loss': output.get('paragraph_loss')}
 
         progress_bar = {'lr': lr,
-                        'n_updates': total_loss.new_ones(1) * self._num_grad_updates, 'loss': total_loss}
-        result = {'loss': total_loss, 'progress_bar': progress_bar, 'log': tensorboard_logs}
+                        'n_updates': total_loss.new_ones(1) * self.global_step}
+        for k, v in tensorboard_logs.items():
+            if 'f1' not in k:
+                self.log(k, v, on_step=True, on_epoch=True, prog_bar=True)
+        result = {'loss': total_loss}
         return result
 
     def _validation_step(self, batch, batch_number):
@@ -717,8 +726,7 @@ class HotpotModel(pl.LightningModule):
         if self.args.linear_mixing is None:
             if self.args.dynamic_mixing_ratio:
                 # gradually increase mixing ratio to focus more on spans in later
-                mixing_ratio = self._num_grad_updates / self.args.total_num_updates
-                total_loss = mixing_ratio * output['span_loss'] + (1 - mixing_ratio) * output['sent_loss']
+                raise NotImplementedError
             else:
                 if hasattr(self.args, 'question_type_classification_head') and \
                         self.args.question_type_classification_head and output['span_loss']:
@@ -770,6 +778,8 @@ class HotpotModel(pl.LightningModule):
                             'val_par_loss': output.get('paragraph_loss'),
                             'val_q_type_acc': output.get('q_type_acc'), 'val_q_type_loss': output.get('q_type_loss')}
         progress_bar = {'val_sent_f1': output['sent_f1'], 'val_em': hotpot_em, 'val_f1': hotpot_f1}
+        for k, v in tensorboard_logs.items():
+            self.log(k, v, on_step=True, on_epoch=True, prog_bar=True)
         result = {'val_loss': total_loss, 'val_em': hotpot_em, 'val_span_f1': hotpot_f1,
                   'val_sent_f1': output['sent_f1'], 'val_span_em': hotpot_em,
                   'answers': answers, 'supporting_facts': supporting_facts,
@@ -934,7 +944,12 @@ class HotpotModel(pl.LightningModule):
         f1_sent_scores = [item['val_sent_f1'] for item in outputs]
         f1_par_scores = [item['val_par_f1'] for item in outputs]
         if outputs[0]['pred_q_type'] is not None:
-            f1_q_type = calc_f1(torch.stack([x['pred_q_type'] for x in outputs]), torch.stack([x['q_type_labels'] for x in outputs]))
+            question_types = torch.stack([x['pred_q_type'] for x in outputs])
+            quetion_type_labels = torch.stack([x['q_type_labels'] for x in outputs])
+            question_types = question_types.detach().cpu().numpy()
+            quetion_type_labels = quetion_type_labels.detach().cpu().numpy()
+            f1_q_type = metrics.f1_score(quetion_type_labels, question_types, average='macro')
+            f1_q_type = avg_loss.new_ones(1) * f1_q_type
         else:
             f1_q_type = avg_loss.new_zeros(1).float()
         # print('validation end before sync', len(int_qids), len(answer_scores), len(f1_scores), len(em_scores))
@@ -977,16 +992,18 @@ class HotpotModel(pl.LightningModule):
         else:
             avg_val_par_f1 = 0.0
 
-        logs = {'val_loss': avg_loss, 'val_f1': avg_val_f1, 'avg_val_f1': avg_val_f1, 'avg_val_sent_f1': avg_val_sent_f1, 'avg_val_em': avg_val_em, 'avg_val_par_f1': avg_val_par_f1, 'avg_f1_q_type': f1_q_type}
         progress_bar = {'avg_val_sent_f1': avg_val_sent_f1, 'avg_val_em': avg_val_em}
         avg_combined_f1 = (avg_val_f1 + avg_val_sent_f1) / 2.0
+        logs = {'val_loss': avg_loss, 'val_f1': avg_val_f1, 'avg_val_f1': avg_val_f1, 'avg_val_sent_f1': avg_val_sent_f1, 'avg_val_em': avg_val_em, 'avg_val_par_f1': avg_val_par_f1, 'avg_f1_q_type': f1_q_type, 'avg_combined_f1': avg_combined_f1}
+        for k, v in logs.items():
+            self.log(k, v)
 
         return {'avg_val_loss': avg_loss, 'avg_sent_f1': avg_val_sent_f1, 'avg_combined_f1': avg_combined_f1, 'log': logs, 'progress_bar': logs}
 
     def validation_step(self, batch, batch_nb):
         return self._validation_step(batch, batch_nb)
 
-    def validation_end(self, outputs):
+    def validation_epoch_end(self, outputs):
         return self._validation_end(outputs)
 
     def _top_sentences_for_p(self, p: int, sentence_to_score: dict, par_to_sents: dict) -> Iterable[int]:
@@ -1234,7 +1251,7 @@ class HotpotModel(pl.LightningModule):
         parser.add_argument("--val-check-interval", type=int, default=250, help="number of gradient updates between checking validation loss")
         parser.add_argument("--version", type=int, default=0, help="Run id for checkpointing")
 
-        parser.add_argument("--warmup", type=int, default=200, help="Number of warmup steps")
+        parser.add_argument("--warmup-steps", type=float, default=0.1, help="Number of warmup steps")
         parser.add_argument("--val-percent-check", default=0.2, type=float)
         parser.add_argument("--test-percent-check", default=1.0, type=float)
         parser.add_argument("--lr", type=float, default=0.00003, help="Maximum learning rate")
@@ -1279,7 +1296,7 @@ class HotpotModel(pl.LightningModule):
         parser.add_argument("--fancy-decode", default=False, action='store_true')
         parser.add_argument("--simple-sentence-decode", default=False, action='store_true')
         parser.add_argument("--overrides", default=None, help='override model args when loading a checkpoint, a json string')
-        parser.add_argument("--attention-mode", choices={'n2', 'tvm', 'sliding_chunks'}, default='sliding_chunks')
+        parser.add_argument("--attention-mode", choices={'n2', 'tvm', 'sliding_chunks', 'sliding_chunks_no_overlap'}, default='sliding_chunks')
 
         parser.add_argument("--fp32", action='store_true', help="default is fp16. Use --fp32 to switch to fp32")
         parser.add_argument("--optimizer-type", choices={'fairseq_optimizer', 'adam'}, default='adam')
@@ -1294,6 +1311,7 @@ class HotpotModel(pl.LightningModule):
         parser.add_argument("--weight_decay", type=float, default=0.01)
         parser.add_argument("--adam_epsilon", type=float, default=1e-6)
         parser.add_argument("--adafactor", action="store_true")
+        parser.add_argument("--tokenizer-path", default=None)
         return parser
 
 
@@ -1317,7 +1335,7 @@ def main(args):
         overrides = {'model_path': args.model_path, 'num_gpus': args.num_gpus, 'total_gpus': args.total_gpus}
         print(overrides)
         if args.overrides:
-            for k, v in json.loads(args.overrides).items():
+            for k, v in json.loads(argsoverrides).items():
                 overrides[k] = v
         model = HotpotModel.load_from_checkpoint(
             args.test_checkpoint,
@@ -1327,7 +1345,7 @@ def main(args):
         model.args.num_gpus = args.num_gpus  # TODO: add support for ddp in test
         model.args.total_gpus = args.total_gpus
         model.args.attention_window = 256  # ugly hack, when loading the model from pretrained the attention window is not loaded, need to manually set
-        model.args.attention_mode = 'sliding_chunks'
+        model.args.attention_mode = 'sliding_chunks_no_overlap'
         model.args.dev_file = args.dev_file
         model.args.test_file = args.dev_file
         model.args.train_file = args.dev_file  # the model won't get trained, pass in the dev file instead to load faster
