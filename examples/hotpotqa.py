@@ -45,9 +45,29 @@ from longformer import sliding_chunks
 from longformer.longformer import Longformer
 from longformer.sliding_chunks import pad_to_window_size
 
+from transformers import RobertaTokenizer, AdamW
+from transformers.optimization import (
+    Adafactor,
+    get_cosine_schedule_with_warmup,
+    get_cosine_with_hard_restarts_schedule_with_warmup,
+    get_linear_schedule_with_warmup,
+    get_polynomial_decay_schedule_with_warmup,
+)
+
 FIXED_SEED = 9090
 
 dev_json_cache = None
+
+arg_to_scheduler = {
+    "linear": get_linear_schedule_with_warmup,
+    "cosine": get_cosine_schedule_with_warmup,
+    "cosine_w_restarts": get_cosine_with_hard_restarts_schedule_with_warmup,
+    "polynomial": get_polynomial_decay_schedule_with_warmup,
+    # '': get_constant_schedule,             # not supported for now
+    # '': get_constant_schedule_with_warmup, # not supported for now
+}
+arg_to_scheduler_choices = sorted(arg_to_scheduler.keys())
+arg_to_scheduler_metavar = "{" + ", ".join(arg_to_scheduler_choices) + "}"        
 
 
 def powerset(iterable):
@@ -1113,87 +1133,50 @@ class HotpotModel(pl.LightningModule):
 
             return metrics
 
-    def optimizer_step(self, current_epoch, batch_nb, optimizer, optimizer_i, second_order_closure=None):
-        # batch_nb is batch number in the current epoch
-        # it is incremented for each batch, not for each gradient update
-        optimizer.step()
-        optimizer.zero_grad()
-        self._num_grad_updates += 1
-        if self.args.optimizer_type == 'fairseq_optimizer':
-            self.scheduler.step_update(self._num_grad_updates)
-        else:
-            self.scheduler.step(self._num_grad_updates)
+    def total_steps(self) -> int:
+        """The number of total training steps that will be run. Used for lr scheduler purposes."""
+        num_devices = max(1, self.hparams.total_gpus)  # TODO: consider num_tpu_cores
+        effective_batch_size = self.hparams.batch_size * self.hparams.grad_accum * num_devices
+        dataset_size = len(self.train_loader.dataset)
+        return (dataset_size / effective_batch_size) * self.hparams.num_epochs
 
+    def get_lr_scheduler(self):
+        get_schedule_func = arg_to_scheduler[self.hparams.lr_scheduler]
+        num_warmup_steps = int(self.hparams.warmup_steps * self.total_steps())
+        scheduler = get_schedule_func(
+            self.opt, num_warmup_steps=num_warmup_steps, num_training_steps=self.total_steps()
+        )
+        scheduler = {"scheduler": scheduler, "interval": "step", "frequency": 1}
+        return scheduler
 
     def configure_optimizers(self):
-        if self.args.optimizer_type == 'fairseq_optimizer':
-            from fairseq import optim
-            from fairseq.optim.lr_scheduler import build_lr_scheduler
+        """Prepare optimizer and schedule (linear warmup and decay)"""
+        model = self.roberta
+        no_decay = ["bias", "LayerNorm.weight"]
+        optimizer_grouped_parameters = [
+            {
+                "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+                "weight_decay": self.hparams.weight_decay,
+            },
+            {
+                "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+                "weight_decay": 0.0,
+            },
+        ]
+        if self.hparams.adafactor:
+            optimizer = Adafactor(
+                optimizer_grouped_parameters, lr=self.hparams.lr, scale_parameter=False, relative_step=False
+            )
 
-            if hasattr(self.args, 'fp16') and self.args.fp16:
-                self.half()
-
-            # TODO: handle restart
-            self.roberta.args.lr = [self.args.lr]
-            if hasattr(self.args, 'fp16') and self.args.fp16:
-                self.half()
-                optimizer = optim.FP16Optimizer.build_optimizer(self.roberta.args, list(self.parameters()))
-                print("Using fp16")
-                print(optimizer)
-            else:
-                optimizer = optim.build_optimizer(self.roberta.args, self.parameters())
-
-            self.roberta.args.lr_scheduler = 'polynomial_decay'
-            self.roberta.args.reset_lr_scheduler = True
-            self.roberta.args.warmup_updates = self.args.warmup
-            self.roberta.args.end_learning_rate = 0.0
-            self.roberta.args.min_lr = 0.0
-            gpu_count = max(self.args.total_gpus, 1)
-            grad_accum_steps = self.args.batch_size if self.args.model_type == 'longformer' else self.args.grad_accum  # This model doesn't work with batch size greater than 1
-            if self.args.model_type == 'tvm_roberta' or self.args.model_type == 'longformer':
-                self.args.total_num_updates = (self.args.num_epochs * self.args.dataset_size / self.args.batch_size / gpu_count)
-            else:
-                self.args.total_num_updates = (self.args.num_epochs * self.args.dataset_size / self.args.grad_accum / gpu_count)
-            print(f'\n\n-------\n effective batch size: {gpu_count * 1 * grad_accum_steps}\n'
-                f'total num updates: {self.args.total_num_updates}\n\n----\n')
-            self.roberta.args.power = 1.0
-            self.scheduler = build_lr_scheduler(self.roberta.args, optimizer)
-
-            if self.args.resume_from_checkpoint is not None:
-                checkpoint = torch.load(self.args.resume_from_checkpoint, map_location='cpu')
-                self._num_grad_updates = int(checkpoint['global_step'] / checkpoint['hparams']['batch_size'])
-            else:
-                self._num_grad_updates = 0
-            if self.args.ignore_scheduler_state:
-                self._num_grad_updates = 0
-            else:
-                self.scheduler.step_update(self._num_grad_updates)
-
-            return [optimizer]
-        elif self.args.optimizer_type == 'adam':
-            grad_accum_steps = self.args.batch_size  # This model doesn't work with batch size greater than 1
-            gpu_count = max(self.args.total_gpus, 1)
-            self.args.total_num_updates = (self.args.num_epochs * self.args.dataset_size / self.args.batch_size / gpu_count)
-            print(f'\n\n-------\n effective batch size: {gpu_count * 1 * grad_accum_steps}\n'
-                f'total num updates: {self.args.total_num_updates}\n\n----\n')
-
-            def lr_lambda(current_step):
-                if current_step < self.args.warmup:
-                    return float(current_step) / float(max(1, self.args.warmup))
-                return max(0.0, float(self.args.total_num_updates - current_step) / float(max(1, self.args.total_num_updates - self.args.warmup)))
-            optimizer = torch.optim.Adam(self.parameters(), lr=self.args.lr)
-            self.scheduler = LambdaLR(optimizer, lr_lambda, last_epoch=-1)  # scheduler is not saved in the checkpoint, but global_step is, which is enough to restart
-            self.scheduler.step(self.global_step / self.hparams.batch_size)
-
-            if self.args.resume_from_checkpoint is not None:
-                checkpoint = torch.load(self.args.resume_from_checkpoint, map_location='cpu')
-                self._num_grad_updates = int(checkpoint['global_step'] / checkpoint['hparams']['batch_size'])
-            else:
-                self._num_grad_updates = 0
-
-            return optimizer
         else:
-            assert False
+            optimizer = AdamW(
+                optimizer_grouped_parameters, lr=self.hparams.lr, eps=self.hparams.adam_epsilon
+            )
+        self.opt = optimizer
+
+        scheduler = self.get_lr_scheduler()
+
+        return [optimizer], [scheduler]
 
     def _get_loader(self, split):
         fname = os.path.join(self.args.train_file if split=='train' else self.args.dev_file)
@@ -1214,8 +1197,11 @@ class HotpotModel(pl.LightningModule):
                 dataset, batch_size=batch_size, shuffle=is_train, num_workers=self.args.num_workers, collate_fn=custom_collate)
         return loader
 
+    def setup(self, mode):
+        self.train_loader = self._get_loader("train")        
+
     def train_dataloader(self):
-        return self._get_loader('train')
+        return self.train_loader
 
     def val_dataloader(self):
         if self.val_dataloader_obj is not None:
@@ -1299,7 +1285,15 @@ class HotpotModel(pl.LightningModule):
         parser.add_argument("--optimizer-type", choices={'fairseq_optimizer', 'adam'}, default='adam')
 
         parser.add_argument("--include-entities", default=False, action='store_true')
-
+        parser.add_argument("--lr_scheduler",
+            default="linear",
+            choices=arg_to_scheduler_choices,
+            metavar=arg_to_scheduler_metavar,
+            type=str,
+            help="Learning rate scheduler")
+        parser.add_argument("--weight_decay", type=float, default=0.01)
+        parser.add_argument("--adam_epsilon", type=float, default=1e-6)
+        parser.add_argument("--adafactor", action="store_true")
         return parser
 
 
@@ -1371,8 +1365,7 @@ def main(args):
             save_top_k=3,
             verbose=True,
             monitor=monitor_metric,
-            mode='max',
-            period=-1
+            mode='max'
         )
 
         if args.initialize_from_checkpoint:
@@ -1389,10 +1382,10 @@ def main(args):
         trainer = Trainer(gpus=args.num_gpus, distributed_backend='ddp' if args.total_gpus > 1 else None,
                             track_grad_norm=-1,
                             accumulate_grad_batches=args.batch_size if args.model_type in ['tvm_roberta', 'longformer'] else args.grad_accum,
-                            max_epochs=args.num_epochs, early_stop_callback=None,
+                            max_epochs=args.num_epochs,
                             val_check_interval=args.val_check_interval * args.batch_size if args.model_type=='tvm_roberta' else args.val_check_interval,
                             logger=logger,
-                            val_percent_check=args.val_percent_check,
+                            limit_val_batches=args.val_percent_check,
                             checkpoint_callback=checkpoint_callback,
                             resume_from_checkpoint=args.resume_from_checkpoint,
                             precision=16 if not args.fp32 else 32)
@@ -1405,5 +1398,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser = HotpotModel.add_model_specific_args(parser)
     args = parser.parse_args()
+    assert args.warmup_steps <= 1.0
 #    args = args_class()
     main(args)
