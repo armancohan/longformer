@@ -245,7 +245,7 @@ def get_activations(model, q_ids, doc_ids, max_seq_len, kwargs, extra_attn, symm
     doc_len = doc_ids.shape[1]
 
     attn_mode = model.encoder.layer[0].attention.self.attention_mode
-    if attn_mode in {'tvm', 'sliding_chunks'} and extra_attn:
+    if attn_mode in {'tvm', 'sliding_chunks', 'sliding_chunks_no_overlap'} and extra_attn:
         # always attend to the canidate_ids
         include_extra_attention_mask = True
     else:
@@ -262,9 +262,13 @@ def get_activations(model, q_ids, doc_ids, max_seq_len, kwargs, extra_attn, symm
         if entity_attention is not None:
             entity_attention = torch.cat([q_ids.new_zeros(q_ids.shape, dtype=bool), entity_attention.bool()], dim=1)
             sentence_mask = entity_attention | sentence_mask
-        extra_attention_mask = torch.zeros(token_ids.shape, dtype=torch.bool, device=token_ids.device)
-        extra_attention_mask[sentence_mask] = 1  # attend to all sentences
-        extra_attention_mask[:, :q_len] = 1  # attend to question tokens
+
+        # longformer attention mask = 1 means local attention
+        extra_attention_mask = torch.ones(token_ids.shape, dtype=torch.bool, device=token_ids.device).int()
+
+        # set global attention
+        extra_attention_mask[sentence_mask] = 2  # attend to all sentences
+        extra_attention_mask[:, :q_len] = 2  # attend to question tokens
 
         if model_type == 'longformer':
             token_ids, extra_attention_mask = pad_to_window_size(token_ids, extra_attention_mask, attention_window, pad_token_id)
@@ -296,10 +300,10 @@ def get_activations(model, q_ids, doc_ids, max_seq_len, kwargs, extra_attn, symm
                 sentence_mask = par_mask | sentence_mask
             if entity_attention is not None:
                 sentence_mask = entity_attention | sentence_mask
-            extra_attention_mask = torch.zeros(token_ids.shape, dtype=torch.bool, device=token_ids.device)
-            extra_attention_mask[sentence_mask] = 1  # attend to all sentences
+            extra_attention_mask = torch.ones(token_ids.shape, dtype=torch.bool, device=token_ids.device)
+            extra_attention_mask[sentence_mask] = 2  # attend to all sentences
             for i in range(token_ids.shape[0]):
-                extra_attention_mask[i, :q_len] = 1
+                extra_attention_mask[i, :q_len] = 2
 
             token_ids, extra_attention_mask = pad_to_window_size(token_ids, extra_attention_mask, attention_window, pad_token_id)
 
