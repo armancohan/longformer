@@ -1312,6 +1312,7 @@ class HotpotModel(pl.LightningModule):
         parser.add_argument("--adam_epsilon", type=float, default=1e-6)
         parser.add_argument("--adafactor", action="store_true")
         parser.add_argument("--tokenizer-path", default=None)
+        parser.add_argument("--ddp-sharded", default=False, action='store_true', help='use ddp_sharded for more efficient memory usage')
         return parser
 
 
@@ -1397,7 +1398,7 @@ def main(args):
                 model.load_state_dict(checkpoint['state_dict'])
             print('weights initalized')
 
-        trainer = Trainer(gpus=args.num_gpus, distributed_backend='ddp' if args.total_gpus > 1 else None,
+        trainer = Trainer(gpus=args.num_gpus, accelerator='ddp' if args.total_gpus > 1 else None,
                             track_grad_norm=-1,
                             accumulate_grad_batches=args.batch_size if args.model_type in ['tvm_roberta', 'longformer'] else args.grad_accum,
                             max_epochs=args.num_epochs,
@@ -1406,7 +1407,8 @@ def main(args):
                             limit_val_batches=args.val_percent_check,
                             checkpoint_callback=checkpoint_callback,
                             resume_from_checkpoint=args.resume_from_checkpoint,
-                            precision=16 if not args.fp32 else 32)
+                            precision=16 if not args.fp32 else 32,
+                            plugins='ddp_sharded' if args.ddp_sharded else None)
 
         trainer.fit(model)
 
