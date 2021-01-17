@@ -157,6 +157,11 @@ def find_string_in_wordpieces(word_pieces, s, tokenizer, lowercase=False):
 
     return matches
 
+
+def get_tokenizer_additional_tokens():
+    return [Q_START, Q_END, TITLE_START, TITLE_END, SENT_MARKER_END, SENT_MARKER, PAR, DOC_START, DOC_END]
+
+
 @lru_cache(maxsize=1)
 def get_roberta_tokenizer(seq_len=999999999):
     from transformers.tokenization_roberta import RobertaTokenizer
