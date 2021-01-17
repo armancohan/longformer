@@ -40,7 +40,8 @@ from hotpotqa_utils.hotpot_eval import exact_match_score
 from hotpotqa_utils.hotpot_eval import f1_score as hotpot_f1_score
 from hotpotqa_utils.hotpot_eval import hotpot_evaluate, sp_metrics
 from hotpotqa_utils.hotpot_prep import (SENT_MARKER_END, TITLE_END, SENT_MARKER,
-                                        get_roberta_tokenizer, DOC_START, DOC_END)
+                                        get_roberta_tokenizer, DOC_START, DOC_END,
+                                        get_tokenizer_additional_tokens)
 from hotpotqa_utils.hotpot_utils import get_final_text
 from longformer import sliding_chunks
 from longformer.longformer import Longformer
@@ -54,6 +55,7 @@ from transformers.optimization import (
     get_linear_schedule_with_warmup,
     get_polynomial_decay_schedule_with_warmup,
 )
+from argparse import Namespace
 
 FIXED_SEED = 9090
 
@@ -69,6 +71,18 @@ arg_to_scheduler = {
 }
 arg_to_scheduler_choices = sorted(arg_to_scheduler.keys())
 arg_to_scheduler_metavar = "{" + ", ".join(arg_to_scheduler_choices) + "}"        
+
+
+def get_tokenizer(tokenizer_path=None):
+    if tokenizer_path is not None:
+        from transformers import AutoTokenizer
+        # for cdlm
+        tok = AutoTokenizer.from_pretrained(tokenizer_path)
+        additional_tokens = get_tokenizer_additional_tokens()
+        tok.add_tokens(additional_tokens)
+    else:
+        tok = get_roberta_tokenizer()
+    return tok
 
 
 def powerset(iterable):
@@ -185,7 +199,7 @@ def custom_collate(batch):
 
 class HotpotDataset(Dataset):
 
-    def __init__(self, file_path, max_seq_len, num_samples=None, split='train'):
+    def __init__(self, file_path, max_seq_len, num_samples=None, split='train', tokenizer_path=None):
         self.data = []
         with open(file_path) as fin:
             for i, line in enumerate(tqdm(fin, desc=f'loading input file {file_path.split("/")[-1]}', unit_scale=1)):
@@ -193,7 +207,7 @@ class HotpotDataset(Dataset):
                 if num_samples and len(self.data) > num_samples:
                     break
         self.max_seq_len = max_seq_len
-        self._tokenizer = get_roberta_tokenizer()
+        self._tokenizer = get_tokenizer(tokenizer_path)
 
         # A mapping from qid to an int, which can be synched across gpus using `torch.distributed`
         if 'train' not in split:  # not for the training set
@@ -286,7 +300,6 @@ def get_activations(model, q_ids, doc_ids, max_seq_len, kwargs, extra_attn, symm
 
         # longformer attention mask = 1 means local attention
         extra_attention_mask = torch.ones(token_ids.shape, dtype=torch.bool, device=token_ids.device).int()
-
         # set global attention
         extra_attention_mask[sentence_mask] = 2  # attend to all sentences
         extra_attention_mask[:, :q_len] = 2  # attend to question tokens
@@ -342,6 +355,8 @@ class HotpotModel(pl.LightningModule):
 
     def __init__(self, args):
         super(HotpotModel, self).__init__()
+        if isinstance(args, dict):
+            args = Namespace(**args)
         self.args = args
         self.hparams = args
 
@@ -352,12 +367,7 @@ class HotpotModel(pl.LightningModule):
         self.signpost_interval = -1  # not used
         self.hparams = args
 
-        if args.tokenizer_path is not None:
-            from transformers import AutoTokenizer 
-            # for cdlm
-            self._tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
-        else:
-            self._tokenizer = get_roberta_tokenizer()
+        self._tokenizer = get_tokenizer(self.args.tokenizer_path)
 
         self._extract_features_args = {}
 
@@ -431,37 +441,6 @@ class HotpotModel(pl.LightningModule):
 
         return model
 
-    @classmethod
-    def load_from_checkpoint(cls, checkpoint_path, map_location=None, overrides=None):
-        r"""
-        Overrides super function to allow passing overrides for loading the model
-        """
-        from argparse import Namespace
-        if map_location is not None:
-            checkpoint = torch.load(checkpoint_path, map_location=map_location)
-        else:
-            checkpoint = torch.load(checkpoint_path, map_location=lambda storage, loc: storage)
-
-        try:
-            ckpt_hparams = checkpoint['hparams']
-        except KeyError:
-            raise IOError(
-                "Checkpoint does not contain hyperparameters. Are your model hyperparameters stored"
-                "in self.hparams?"
-            )
-        if overrides is not None:
-            for k in overrides:
-                ckpt_hparams[k] = overrides[k]
-        hparams = Namespace(**ckpt_hparams)
-
-        # load the state_dict on the model automatically
-        model = cls(hparams)
-        # model.load_state_dict(checkpoint['state_dict'])
-
-        # give model a chance to load something
-        model.on_load_checkpoint(checkpoint)
-
-        return model
 
     # def backward(self, use_amp, loss, optimizer):
     #     if self.args.fp16 and self.args.optimizer_type == 'fairseq_optimizer':
@@ -820,7 +799,8 @@ class HotpotModel(pl.LightningModule):
                                               'end_logit': end_logits[i][end_logit_index].item()})
             sorted_answers = sorted(potential_answers, key=lambda x: (x['start_logit'] + x['end_logit']), reverse=True)
             if len(sorted_answers) == 0:
-                answers.append({'text': 'null', 'score': -1000000})
+                # default to "NO"
+                answers.append({'text': 'no', 'score': -1000000})
             else:
                 if fancy_span_decode:
                     answer = sorted_answers[0]
@@ -900,17 +880,14 @@ class HotpotModel(pl.LightningModule):
                         if len(ss1) <= 0:
                             continue
                         ss1_score = sum(sentence_to_score[p1, s1] for s1 in ss1)
-                        try:
-                            for ss2 in powerset(self._top_sentences_for_p(p2, sentence_to_score, par_to_sent_idx)):
-                                if len(ss2) <= 0:
-                                    continue
-                                ss2_score = sum(sentence_to_score[p2, s2] for s2 in ss2)
-                                new_scored_node_sets[frozenset(
-                                    {(p1, s1) for s1 in ss1} |
-                                    {(p2, s2) for s2 in ss2}
-                                )] = ss1_score + ss2_score
-                        except KeyError:
-                            import ipdb; ipdb.set_trace()
+                        for ss2 in powerset(self._top_sentences_for_p(p2, sentence_to_score, par_to_sent_idx)):
+                            if len(ss2) <= 0:
+                                continue
+                            ss2_score = sum(sentence_to_score[p2, s2] for s2 in ss2)
+                            new_scored_node_sets[frozenset(
+                                {(p1, s1) for s1 in ss1} |
+                                {(p2, s2) for s2 in ss2}
+                            )] = ss1_score + ss2_score
             valid_scored_node_sets = {}
             for k, v in new_scored_node_sets.items():
                 pars = {e[0] for e in k}
@@ -1010,16 +987,25 @@ class HotpotModel(pl.LightningModule):
         s_with_score = [(s, sentence_to_score[(p, s)]) for s in par_to_sents[p]]
         s_with_score.sort(key=lambda x: -x[1])
         sub_zero_yielded = 0
+        above_zero_yielded = 0
         for s, score in s_with_score:
             if score < 0:
                 if sub_zero_yielded >= 2:
                     break
                 else:
                     sub_zero_yielded += 1
+            if score >= 0 and score < 0.1:  # not too confident
+                # NOTE: Hardcode warning. Max number of yielded sentences with score above 0.1
+                if above_zero_yielded >= 4:
+                    break
+                else:
+                    above_zero_yielded += 1
+            else:
+                above_zero_yielded += 1
             yield s
 
     def test_step(self, batch, batch_nb):
-        q_id, q_tokens, doc_tokens, start_pos, end_pos, answer_str, sent_labels, num_sents, num_pars, pars, sent_idx, par_offsets, sent_to_par_idx, par_labels, q_type_label, token_to_orig_map, orig_doc_tokens, entity_attention, q_lens, doc_lens, sent_lens, par_lens = batch
+        q_id, q_tokens, doc_tokens, start_pos, end_pos, answer_str, sent_labels, num_sents, num_pars, pars, sent_idx, par_idx, sent_to_par_idx, par_labels, q_type_label, token_to_orig_map, orig_doc_tokens, entity_attention, q_lens, doc_lens, sent_lens, par_lens = batch
         n_batch = len(q_tokens)
         assert n_batch == 1  # doesn't currently support larger batch size
         assert len(sent_to_par_idx) == 1
@@ -1028,20 +1014,22 @@ class HotpotModel(pl.LightningModule):
         start_logits = output['start_logits']
         end_logits = output['end_logits']
         par_logits = output['par_logits']
+        type_logits = output['q_type_logits']
         input_ids = torch.cat([q_tokens, doc_tokens], dim=1)
         # answers, supporting_facts, related_sentence_index, sentence_to_score = self.decode(input_ids, start_logits, end_logits, q_lens, sent_logits, par_logits, pars, sent_to_par_idx, simple_sentence_decode=False)
         ret = {
             'q_id': q_id[0],
-            'input_ids': input_ids,
-            'start_logits': start_logits,
-            'end_logits': end_logits,
-            'q_lens': q_lens,
-            'sent_logits': sent_logits, 
-            'par_logits': par_logits,
+            'input_ids': input_ids.cpu(),
+            'start_logits': start_logits.detach().cpu(),
+            'end_logits': end_logits.detach().cpu(),
+            'q_lens': q_lens.cpu(),
+            'sent_logits': sent_logits.detach().cpu(), 
+            'par_logits': par_logits.detach().cpu(),
+            'type_logits': type_logits.detach().cpu()
         }
         return ret
 
-    def test_end(self, outputs):
+    def test_epoch_end(self, outputs):
         if self.args.test_file_orig:
             with open(self.args.test_file_orig) as fin:
                 test_gold = json.load(fin)
@@ -1058,7 +1046,7 @@ class HotpotModel(pl.LightningModule):
         q_lens = [e['q_lens'] for e in outputs if e is not None]
         sent_logits = [e['sent_logits'] for e in outputs if e is not None]
         par_logits = [e['par_logits'] for e in outputs if e is not None]
-        if outputs and outputs[0].get('type_logits'):
+        if outputs and outputs[0].get('type_logits') is not None:
             type_logits = [e['type_logits'] for e in outputs if e is not None]
         else:
             type_logits = [None for _ in outputs]
@@ -1069,7 +1057,7 @@ class HotpotModel(pl.LightningModule):
         for _int_qid, _input_id, _start_logit, _end_logit, _q_len, _sent_logit, _par_logit, _type_logit in \
                 tqdm(zip(int_qids, input_ids, start_logits, end_logits, q_lens, sent_logits, par_logits, type_logits),
                      total=len(int_qids),
-                     disable=(self.trainer.use_ddp and self.trainer.proc_rank > 0), desc='decoding...'):
+                     disable=(self.trainer.use_ddp and self.trainer.global_rank > 10), desc=f'decoding [RNK{self.trainer.global_rank}]...'):
 
             qid = self.test_dataloader_obj.dataset[_int_qid][0]
             assert qid not in answer
@@ -1085,6 +1073,7 @@ class HotpotModel(pl.LightningModule):
             par_score = _par_logit[:, 1].tolist()
             par_scores[qid] = par_score
             par_by_id[qid] = pars
+            print(answers[0]['text'], print())
             answer[qid] = answers[0]['text']
             sp[qid] = supporting_facts
             related_sent_index[qid] = related_sentence_index
@@ -1094,17 +1083,21 @@ class HotpotModel(pl.LightningModule):
 
         pathlib.Path(self.args.test_output_dir).mkdir(parents=True, exist_ok=True)
 
+        print('**'*60)
+        print(self.trainer.global_rank)
+        print('**'*20)
         if self.trainer.use_ddp:
             # create intermediate files for each worker output
-            predictions_file = self.args.test_output_dir + f'/prediction-output_rank-{self.trainer.proc_rank}.json'
-            with open(self.args.test_output_dir + f'/related-sentence-index_rank-{self.trainer.proc_rank}.json', 'w') as f_out:
+            predictions_file = self.args.test_output_dir + f'/prediction-output_rank-{self.trainer.global_rank}.json'
+            with open(self.args.test_output_dir + f'/related-sentence-index_rank-{self.trainer.global_rank}.json', 'w') as f_out:
                 json.dump(related_sent_index, f_out)
             with open(predictions_file, 'w') as f_out:
                 json.dump(predictions, f_out)
 
+            print(f'barrier: rank:{self.trainer.global_rank}, waiting for others to arrive')
             torch.distributed.barrier()
 
-            if self.trainer.proc_rank == 0:
+            if self.trainer.global_rank == 0:
                 all_predictions = {'answer': {}, 'sp': {}, 'sentence_scores': {}, 'par_scores': {}, 'par_by_id': {}}
                 all_related_sent_index = {}
                 for rank in range(self.trainer.world_size):
@@ -1119,6 +1112,7 @@ class HotpotModel(pl.LightningModule):
 
                 metrics = None
                 if self.args.test_file_orig:
+                    print('evaluating')
                     metrics = hotpot_evaluate(all_predictions, test_gold, hotpot_format=True, allow_partial_prediction=False)
                     metrics_file = self.args.test_output_dir + f'/metrics.json'
                     with open(metrics_file, 'w') as f_out:
@@ -1128,9 +1122,10 @@ class HotpotModel(pl.LightningModule):
                     json.dump(all_related_sent_index, f_out)
                 with open(predictions_file, 'w') as f_out:
                     json.dump(all_predictions, f_out)
-                return metrics
             else:
-                return {}
+                metrics = {}
+            torch.distributed.barrier()
+            return metrics
         else:
             predictions_file = self.args.test_output_dir + f'/prediction-output.json'
 
@@ -1198,8 +1193,7 @@ class HotpotModel(pl.LightningModule):
     def _get_loader(self, split):
         fname = os.path.join(self.args.train_file if split=='train' else self.args.dev_file)
         is_train = split == 'train'
-
-        dataset = HotpotDataset(fname, max_seq_len=self.args.max_seq_len, num_samples=self.args.num_samples, split=split)
+        dataset = HotpotDataset(fname, max_seq_len=self.args.max_seq_len, num_samples=self.args.num_samples, split=split, tokenizer_path=self.args.tokenizer_path)
 
         if self.args.total_gpus > 1:
             # sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True)
@@ -1215,7 +1209,7 @@ class HotpotModel(pl.LightningModule):
         return loader
 
     def setup(self, mode):
-        self.train_loader = self._get_loader("train")        
+        self.train_loader = self._get_loader("train")
 
     def train_dataloader(self):
         return self.train_loader
@@ -1336,11 +1330,11 @@ def main(args):
         overrides = {'model_path': args.model_path, 'num_gpus': args.num_gpus, 'total_gpus': args.total_gpus}
         print(overrides)
         if args.overrides:
-            for k, v in json.loads(argsoverrides).items():
+            for k, v in json.loads(args.overrides).items():
                 overrides[k] = v
         model = HotpotModel.load_from_checkpoint(
             args.test_checkpoint,
-            overrides=overrides
+            # overrides=overrides
         )
         model.args = args
         model.args.num_gpus = args.num_gpus  # TODO: add support for ddp in test
@@ -1350,7 +1344,7 @@ def main(args):
         model.args.dev_file = args.dev_file
         model.args.test_file = args.dev_file
         model.args.train_file = args.dev_file  # the model won't get trained, pass in the dev file instead to load faster
-        trainer = Trainer(gpus=args.num_gpus, test_percent_check=args.test_percent_check, train_percent_check=0.01, val_percent_check=0.01,
+        trainer = Trainer(gpus=args.num_gpus, limit_test_batches=args.test_percent_check, limit_train_batches=0.01, limit_val_batches=0.01,
                           distributed_backend='ddp' if args.total_gpus > 1 else None)
         trainer.test(model)
 
